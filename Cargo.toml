@@ -8,7 +8,7 @@ description = "Rust binding for the Playgama Bridge web SDK: platform messages, 
 repository = "https://github.com/mlm-games/playgama-bridge"
 readme = "README.md"
 keywords = ["gamedev", "web", "wasm", "playgama", "bridge"]
-categories = ["game-development", "web-programming::wasm"]
+categories = ["game-development", "web-programming"]
 rust-version = "1.98"
 
 [dependencies]
