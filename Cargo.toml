@@ -3,6 +3,7 @@ name = "playgama-bridge"
 version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
+authors = ["mlm-games"]
 description = "Rust binding for the Playgama Bridge web SDK: platform messages, ads, cloud storage, social, leaderboards, payments, achievements and remote config."
 repository = "https://github.com/mlm-games/playgama-bridge"
 readme = "README.md"

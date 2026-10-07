@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy (native; mocks and tests only)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (wasm; the live window.bridge bindings)
+        run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - name: test (native; mocks only)
+        run: cargo test
+      - name: doc (wasm; the module docs live behind the wasm cfg)
+        run: cargo doc --target wasm32-unknown-unknown --no-deps
