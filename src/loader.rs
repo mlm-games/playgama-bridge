@@ -5,10 +5,11 @@
 //! error, or if it has not arrived within `timeout_ms`, a local
 //! `playgama-bridge.js` is loaded instead.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use js_sys::{Array, Function, Promise, Reflect};
+use js_sys::{Array, Function, Object, Promise, Reflect};
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -38,21 +39,32 @@ pub fn set_game_loading_progress(progress: f64) {
 
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
-    pub remote_url: &'static str,
-    pub local_url: &'static str,
+    /// Where the SDK is fetched from when the page has none. A `Cow` so a
+    /// caller can hand over a URL it built at runtime.
+    pub remote_url: Cow<'static, str>,
+    /// The fallback, tried when the CDN misses.
+    pub local_url: Cow<'static, str>,
     /// How long the remote script gets before the local one is tried.
     pub timeout_ms: i32,
     /// `bridge.engine`; `None` leaves whatever the page set.
     pub engine: Option<&'static str>,
+    /// `initialize({ configFilePath })`. The SDK otherwise looks for
+    /// `playgama-bridge-config.json` next to the page.
+    pub config_file_path: Option<Cow<'static, str>>,
+    /// `bridge.gameVersion`, tagged onto analytics events. Set before the SDK
+    /// initializes, so the first batch already carries it.
+    pub game_version: Option<Cow<'static, str>>,
 }
 
 impl Default for LoadOptions {
     fn default() -> Self {
         Self {
-            remote_url: REMOTE_BRIDGE_URL,
-            local_url: LOCAL_BRIDGE_URL,
+            remote_url: Cow::Borrowed(REMOTE_BRIDGE_URL),
+            local_url: Cow::Borrowed(LOCAL_BRIDGE_URL),
             timeout_ms: 2000,
             engine: Some(DEFAULT_ENGINE),
+            config_file_path: None,
+            game_version: None,
         }
     }
 }
@@ -63,9 +75,11 @@ pub enum LoadError {
     NoDocument,
     /// Neither the CDN nor the local script produced a bridge.
     NoBridge,
-    /// The bridge loaded but is missing one of the fourteen modules.
+    /// The bridge has no `initialize`, or it did not come up after loading.
+    /// A module the SDK left out is not this: each one falls back to its own
+    /// stand-in so one missing module costs only itself.
     IncompleteBridge,
-    /// `bridge.initialize()` rejected.
+    /// `bridge.initialize()` rejected. The SDK's own reason is on the console.
     InitializeFailed,
 }
 
@@ -74,7 +88,7 @@ impl std::fmt::Display for LoadError {
         let text = match self {
             Self::NoDocument => "the page has no document to load the bridge into",
             Self::NoBridge => "playgama-bridge.js did not define window.bridge",
-            Self::IncompleteBridge => "window.bridge is missing one of the fourteen modules",
+            Self::IncompleteBridge => "window.bridge has no initialize, or it did not come up",
             Self::InitializeFailed => "bridge.initialize() rejected",
         };
         f.write_str(text)
@@ -86,39 +100,55 @@ impl std::error::Error for LoadError {}
 /// Load the SDK if the page has not already, then initialize it.
 pub async fn load(options: LoadOptions) -> Result<Bridge, LoadError> {
     if js::global_bridge().is_none() {
-        let remote = inject(options.remote_url)?;
+        let remote = inject(&options.remote_url)?;
         let settled = when_loaded(&remote, options.timeout_ms).await;
         if !settled || js::global_bridge().is_none() {
-            // The template tears the remote tag down and clears the global
-            // before the local one, so a late CDN arrival cannot win.
+            // The template tears the remote tag down and clears the globals
+            // before the local one, because the SDK installs itself only when
+            // both are free (`window.bridge || window.playgamaBridge || assign`).
+            // Removing the tag does not cancel a fetch already under way, so a
+            // remote that lands in the gap takes the page instead and the local
+            // script then installs nothing. Nothing here can order those two.
             remote.remove();
             js::clear_global_bridge();
-            let local = inject(options.local_url)?;
+            let local = inject(&options.local_url)?;
             if !when_loaded(&local, options.timeout_ms).await || js::global_bridge().is_none() {
                 return Err(LoadError::NoBridge);
             }
         }
     }
-    initialize(options.engine).await
+    initialize(&options).await
 }
 
-async fn initialize(engine: Option<&'static str>) -> Result<Bridge, LoadError> {
+async fn initialize(options: &LoadOptions) -> Result<Bridge, LoadError> {
     let root = js::global_bridge().ok_or(LoadError::NoBridge)?;
-    if let Some(engine) = engine {
+    if let Some(engine) = options.engine {
         let _ = Reflect::set(
             &root,
             &JsValue::from_str("engine"),
             &JsValue::from_str(engine),
         );
     }
+    if let Some(version) = &options.game_version {
+        let _ = Reflect::set(
+            &root,
+            &JsValue::from_str("gameVersion"),
+            &JsValue::from_str(version),
+        );
+    }
     let initialize = Reflect::get(&root, &JsValue::from_str("initialize"))
         .ok()
         .and_then(|value| value.dyn_into::<Function>().ok())
         .ok_or(LoadError::IncompleteBridge)?;
+    // A bridge whose `initialize` hands back a bare value would leave `JsFuture`
+    // waiting on a `then` that is not there, so this checks the way `settle`
+    // does rather than hanging.
     let promise = initialize
-        .call0(&root)
+        .call1(&root, &init_argument(options))
+        .map_err(|_| LoadError::InitializeFailed)?
+        .dyn_into::<Promise>()
         .map_err(|_| LoadError::InitializeFailed)?;
-    JsFuture::from(Promise::from(promise))
+    JsFuture::from(promise)
         .await
         .map_err(|_| LoadError::InitializeFailed)?;
     let bridge = Bridge::new();
@@ -126,6 +156,21 @@ async fn initialize(engine: Option<&'static str>) -> Result<Bridge, LoadError> {
         return Err(LoadError::IncompleteBridge);
     }
     Ok(bridge)
+}
+
+/// `initialize({ configFilePath })`, or an empty object when the caller has no
+/// path to override. The SDK reads a missing key the same as `undefined`.
+fn init_argument(options: &LoadOptions) -> JsValue {
+    let Some(path) = &options.config_file_path else {
+        return Object::new().into();
+    };
+    let argument = Object::new();
+    let _ = Reflect::set(
+        &argument,
+        &JsValue::from_str("configFilePath"),
+        &JsValue::from_str(path),
+    );
+    argument.into()
 }
 
 fn inject(url: &str) -> Result<web_sys::HtmlScriptElement, LoadError> {

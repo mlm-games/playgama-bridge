@@ -3,6 +3,8 @@
 
 mod achievements;
 mod advertisement;
+mod analytics;
+mod clipboard;
 mod cross_promo;
 mod daily_rewards;
 mod device;
@@ -12,6 +14,7 @@ mod payments;
 mod platform;
 mod player;
 mod remote_config;
+mod root;
 mod social;
 mod storage;
 mod tasks;
@@ -29,9 +32,12 @@ use crate::api::*;
 use crate::convert;
 use crate::inflight::InFlight;
 use crate::signal::Signal;
+use crate::types::BridgeResult;
 
 pub(crate) use achievements::Achievements;
 pub(crate) use advertisement::Advertisement;
+pub(crate) use analytics::Analytics;
+pub(crate) use clipboard::Clipboard;
 pub(crate) use cross_promo::CrossPromo;
 pub(crate) use daily_rewards::DailyRewards;
 pub(crate) use device::Device;
@@ -41,6 +47,7 @@ pub(crate) use payments::Payments;
 pub(crate) use platform::Platform;
 pub(crate) use player::Player;
 pub(crate) use remote_config::RemoteConfig;
+pub(crate) use root::Root;
 pub(crate) use social::Social;
 pub(crate) use storage::Storage;
 pub(crate) use tasks::Tasks;
@@ -66,7 +73,7 @@ fn module_of(root: &JsValue, name: &str) -> Option<Module> {
 
 /// The root object every module hangs off. A module the SDK left out is simply
 /// absent: one missing optional module must not cost the game the other
-/// thirteen.
+/// fifteen.
 pub(crate) fn modules() -> Option<Modules> {
     global_bridge().map(|root| Modules { root })
 }
@@ -119,23 +126,56 @@ impl Module {
             .map_or_else(ObjectMap::new, |v| convert::object_to_map(&v))
     }
 
+    /// Reads a `{ top, right, bottom, left }` insets object, each side
+    /// optional.
+    fn safe_area(&self, key: &str) -> crate::types::SafeArea {
+        let Some(value) = self.get(key) else {
+            return crate::types::SafeArea::default();
+        };
+        let side = |name: &str| {
+            Reflect::get(&value, &JsValue::from_str(name))
+                .ok()
+                .and_then(|side| side.as_f64())
+                .unwrap_or_default()
+        };
+        crate::types::SafeArea {
+            top: side("top"),
+            right: side("right"),
+            bottom: side("bottom"),
+            left: side("left"),
+        }
+    }
+
+    /// The value a method handed back, or a marker carrying why there is none.
+    /// Every SDK method this crate calls is present on a live bridge, so the
+    /// marker only appears for an SDK older than this crate or for a method
+    /// that threw. [`settle`] hands the reason to the caller's callback rather
+    /// than dropping it.
     fn call0(&self, key: &str) -> JsValue {
-        self.method(key).map_or(JsValue::UNDEFINED, |m| {
-            m.call0(&self.object).unwrap_or(JsValue::UNDEFINED)
-        })
+        let Some(method) = self.method(key) else {
+            return call_failed(&JsValue::from_str("the module has no such method"));
+        };
+        method
+            .call0(&self.object)
+            .unwrap_or_else(|thrown| call_failed(&thrown))
     }
 
     fn call1(&self, key: &str, first: &JsValue) -> JsValue {
-        self.method(key).map_or(JsValue::UNDEFINED, |m| {
-            m.call1(&self.object, first).unwrap_or(JsValue::UNDEFINED)
-        })
+        let Some(method) = self.method(key) else {
+            return call_failed(&JsValue::from_str("the module has no such method"));
+        };
+        method
+            .call1(&self.object, first)
+            .unwrap_or_else(|thrown| call_failed(&thrown))
     }
 
     fn call2(&self, key: &str, first: &JsValue, second: &JsValue) -> JsValue {
-        self.method(key).map_or(JsValue::UNDEFINED, |m| {
-            m.call2(&self.object, first, second)
-                .unwrap_or(JsValue::UNDEFINED)
-        })
+        let Some(method) = self.method(key) else {
+            return call_failed(&JsValue::from_str("the module has no such method"));
+        };
+        method
+            .call2(&self.object, first, second)
+            .unwrap_or_else(|thrown| call_failed(&thrown))
     }
 
     /// A method called with an optional argument, which JS sees as `null` when
@@ -145,20 +185,58 @@ impl Module {
     }
 }
 
+/// The marker key on a value that is a thrown error rather than a result.
+const FAILED_KEY: &str = "__playgama_bridge_call_failed";
+
+/// Wraps a thrown value so [`settle`] can tell "the call failed" from "the call
+/// resolved with an object that happens to look like anything".
+fn call_failed(thrown: &JsValue) -> JsValue {
+    let marker = js_sys::Object::new();
+    let _ = Reflect::set(&marker, &JsValue::from_str(FAILED_KEY), thrown);
+    marker.into()
+}
+
+/// The value a call threw, when it threw.
+fn thrown_by(result: &JsValue) -> Option<JsValue> {
+    Reflect::get(result, &JsValue::from_str(FAILED_KEY))
+        .ok()
+        .filter(|thrown| !thrown.is_undefined() && !thrown.is_null())
+}
+
 /// Keeps the JS callbacks we handed to `on` alive for as long as the module is.
-#[derive(Default)]
-pub(crate) struct Listeners(RefCell<Vec<Closure<dyn FnMut(&JsValue)>>>);
+pub(crate) struct Listeners {
+    root: Module,
+    held: RefCell<Vec<Closure<dyn FnMut(&JsValue)>>>,
+}
+
+impl Default for Listeners {
+    /// With no `window.bridge` there is nothing to subscribe to; every
+    /// `listen` is then a no-op.
+    fn default() -> Self {
+        Self {
+            root: Module {
+                object: global_bridge().unwrap_or(JsValue::UNDEFINED),
+            },
+            held: RefCell::new(Vec::new()),
+        }
+    }
+}
 
 impl Listeners {
-    /// `module.on(event, handler)`. The platform calls `handler(value)`
-    /// with the new value as the first argument; some events hand the
-    /// handler an array instead, so both shapes are accepted.
-    pub(crate) fn listen<T, F>(&self, module: &Module, event: &str, parse: F, signal: &Signal<T>)
+    /// `on(event, handler)` on the **root**, which is the only object in the
+    /// SDK carrying it besides `platform`, `device` and `advertisement`. Every
+    /// module shares one bus, so the root hears everything and the per-module
+    /// listeners would only cover 9 of the 15 game-visible events.
+    ///
+    /// The platform calls `handler(value)` with the new value as the first
+    /// argument; some events hand the handler an array instead, so both shapes
+    /// are accepted.
+    pub(crate) fn listen<T, F>(&self, event: &str, parse: F, signal: &Signal<T>)
     where
         T: Clone + 'static,
         F: Fn(&JsValue) -> T + 'static,
     {
-        let Some(on) = module.method("on") else {
+        let Some(on) = self.root.method("on") else {
             return;
         };
         let sink = signal.clone();
@@ -175,42 +253,56 @@ impl Listeners {
         }) as Box<dyn FnMut(&JsValue)>);
         let handler = closure.as_ref().clone();
         if on
-            .call2(&module.object, &JsValue::from_str(event), handler.as_ref())
+            .call2(
+                &self.root.object,
+                &JsValue::from_str(event),
+                handler.as_ref(),
+            )
             .is_ok()
         {
-            self.0.borrow_mut().push(closure);
+            // The JS side holds the handler now, so the wasm `Closure` has to
+            // outlive this call or the next emit throws.
+            self.held.borrow_mut().push(closure);
         }
     }
 }
 
-/// `promise.then(cb).catch(cb)`, collapsed into one callback whose flag says
-/// which side ran. Releases `slot` first, as `_on_js_*_then` does, so the
-/// handler is free to start the same call again.
+/// `promise.then(cb).catch(cb)`, collapsed into one callback that says which
+/// side ran and hands the reason over on the failing one. Releases `slot`
+/// first, as `_on_js_*_then` does, so the handler is free to start the same
+/// call again.
 pub(crate) fn settle(
     result: JsValue,
     in_flight: &InFlight,
     slot: &'static str,
-    callback: Box<dyn FnOnce(bool, JsValue)>,
+    callback: Box<dyn FnOnce(BridgeResult<JsValue>)>,
 ) {
     let guard = in_flight.clone();
-    let finish = move |ok: bool, value: JsValue, callback: Box<dyn FnOnce(bool, JsValue)>| {
+    // A method that handed back a bare value is a failure, not a resolution:
+    // `dyn_into` consumes the value, so read the reason before giving up on it.
+    // The reason is either what the method threw or the bare value itself, which
+    // is how a missing method or a plain `undefined` reads as a refusal.
+    let Ok(promise) = result.clone().dyn_into::<Promise>() else {
         guard.end(slot);
-        callback(ok, value);
-    };
-    let Ok(promise) = result.dyn_into::<Promise>() else {
-        finish(false, JsValue::UNDEFINED, callback);
+        let reason = thrown_by(&result).unwrap_or_else(|| result.clone());
+        callback(Err(convert::error_from_js(&reason)));
         return;
     };
     spawn_local(async move {
-        match JsFuture::from(promise).await {
-            Ok(value) => finish(true, value, callback),
-            Err(_) => finish(false, JsValue::UNDEFINED, callback),
-        }
+        // The slot is released before the handler runs, so a handler may start
+        // the same call again.
+        let outcome = match JsFuture::from(promise).await {
+            Ok(value) => Ok(value),
+            Err(reason) => Err(convert::error_from_js(&reason)),
+        };
+        guard.end(slot);
+        callback(outcome);
     });
 }
 
 /// The trait objects `Bridge` hands out, built from the live SDK.
 pub(crate) struct Web {
+    pub(crate) root: Rc<dyn RootApi>,
     pub(crate) platform: Rc<dyn PlatformApi>,
     pub(crate) device: Rc<dyn DeviceApi>,
     pub(crate) player: Rc<dyn PlayerApi>,
@@ -221,10 +313,12 @@ pub(crate) struct Web {
     pub(crate) payments: Rc<dyn PaymentsApi>,
     pub(crate) achievements: Rc<dyn AchievementsApi>,
     pub(crate) remote_config: Rc<dyn RemoteConfigApi>,
-    pub(crate) cross_promo: Rc<dyn CrossPromoApi>,
-    pub(crate) tasks: Rc<dyn TasksApi>,
-    pub(crate) daily_rewards: Rc<dyn DailyRewardsApi>,
+    pub(crate) clipboard: Rc<dyn ClipboardApi>,
+    pub(crate) analytics: Rc<dyn AnalyticsApi>,
     pub(crate) notifications: Rc<dyn NotificationsApi>,
+    pub(crate) daily_rewards: Rc<dyn DailyRewardsApi>,
+    pub(crate) tasks: Rc<dyn TasksApi>,
+    pub(crate) cross_promo: Rc<dyn CrossPromoApi>,
 }
 
 /// `None` when the page has no bridge at all, so the caller can fall back to
@@ -233,6 +327,7 @@ pub(crate) struct Web {
 pub(crate) fn build(in_flight: &InFlight) -> Option<Web> {
     let modules = modules()?;
     Some(Web {
+        root: Root::attach(),
         platform: Platform::attach(&modules, in_flight).unwrap_or_else(crate::mock::platform),
         device: Device::attach(&modules).unwrap_or_else(crate::mock::device),
         player: Player::attach(&modules, in_flight).unwrap_or_else(crate::mock::player),
@@ -247,11 +342,14 @@ pub(crate) fn build(in_flight: &InFlight) -> Option<Web> {
             .unwrap_or_else(crate::mock::achievements),
         remote_config: RemoteConfig::attach(&modules, in_flight)
             .unwrap_or_else(crate::mock::remote_config),
-        cross_promo: CrossPromo::attach(&modules).unwrap_or_else(crate::mock::cross_promo),
-        tasks: Tasks::attach(&modules, in_flight).unwrap_or_else(crate::mock::tasks),
-        daily_rewards: DailyRewards::attach(&modules, in_flight)
-            .unwrap_or_else(crate::mock::daily_rewards),
+        clipboard: Clipboard::attach(&modules, in_flight).unwrap_or_else(crate::mock::clipboard),
+        analytics: Analytics::attach(&modules).unwrap_or_else(crate::mock::analytics),
         notifications: Notifications::attach(&modules, in_flight)
             .unwrap_or_else(crate::mock::notifications),
+        daily_rewards: DailyRewards::attach(&modules, in_flight)
+            .unwrap_or_else(crate::mock::daily_rewards),
+        tasks: Tasks::attach(&modules, in_flight).unwrap_or_else(crate::mock::tasks),
+        cross_promo: CrossPromo::attach(&modules, in_flight)
+            .unwrap_or_else(crate::mock::cross_promo),
     })
 }

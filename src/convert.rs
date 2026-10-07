@@ -75,6 +75,45 @@ pub fn object_to_map(value: &JsValue) -> crate::api::ObjectMap {
     }
 }
 
+/// An optional object payload: a resolved call whose value is not an object
+/// carries nothing rather than an empty map. `typeof null` is `"object"` in JS,
+/// so null is checked first. Otherwise a declined purchase reading `null` would
+/// come back as an empty map and a caller could not tell them apart.
+pub fn optional_object(value: &JsValue) -> Option<crate::api::ObjectMap> {
+    (!value.is_null() && typeof_object(value) && !Array::is_array(value))
+        .then(|| object_to_map(value))
+}
+
+/// The reason a promise rejected. The SDK throws `BridgeError` with a `code`
+/// when it has one and rejects bare when a feature is simply unsupported, so a
+/// missing code is a real answer and not a parse failure.
+pub fn error_from_js(value: &JsValue) -> crate::types::BridgeError {
+    // A bare `Promise.reject()` has no reason, which is what an unsupported
+    // feature looks like.
+    if !typeof_object(value) {
+        return match value.as_string() {
+            Some(text) => crate::types::BridgeError::detailed(None, None, Some(text), None),
+            None => crate::types::BridgeError::rejected(),
+        };
+    }
+    let field = |name: &str| {
+        Reflect::get(value, &JsValue::from_str(name))
+            .ok()
+            .filter(|item| !item.is_null() && !item.is_undefined())
+            .map(|item| match item.as_string() {
+                Some(text) => text,
+                // `originalError` is a plain string on every throw the SDK
+                // makes; anything else is rendered rather than dropped.
+                None => from_js(&item).to_string(),
+            })
+    };
+    // A code this crate does not know is kept as text rather than dropped, so
+    // a platform newer than the binding still says what failed.
+    let raw_code = field("code");
+    let code = raw_code.as_deref().and_then(|text| text.parse().ok());
+    crate::types::BridgeError::detailed(code, raw_code, field("message"), field("originalError"))
+}
+
 pub fn array_to_vec_of_maps(value: &JsValue) -> Vec<crate::api::ObjectMap> {
     array_to_vec(value).iter().map(object_to_map).collect()
 }

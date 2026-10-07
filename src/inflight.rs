@@ -9,6 +9,13 @@ use std::rc::Rc;
 ///
 /// Shared by every module so a key like `"storage.get"` is unambiguous, which
 /// is what the per-module GDScript guards amount to.
+///
+/// On the live SDK a second call for a slot already in flight is **dropped**, and
+/// its callback is never invoked. That is the same trade the Godot addon makes,
+/// and the reason every promise method here ends in a callback rather than a
+/// return value. A game that reads two keys in a row must wait for the first
+/// callback before starting the second. The editor stand-ins answer
+/// immediately, so this never bites off the web.
 #[derive(Clone, Default)]
 pub struct InFlight(Rc<RefCell<Vec<&'static str>>>);
 

@@ -5,6 +5,7 @@ use crate::api::NotificationsApi;
 use crate::convert;
 use crate::inflight::InFlight;
 use crate::js::{Module, Modules, settle};
+use crate::types::BridgeResult;
 
 pub(crate) struct Notifications {
     module: Module,
@@ -28,7 +29,11 @@ impl NotificationsApi for Notifications {
         self.module.bool("isSupported")
     }
 
-    fn schedule(&self, notification: Option<&serde_json::Value>, callback: Box<dyn FnOnce(bool)>) {
+    fn schedule(
+        &self,
+        notification: Option<&serde_json::Value>,
+        callback: Box<dyn FnOnce(BridgeResult<()>)>,
+    ) {
         let slot = "notifications.schedule";
         if !self.in_flight.begin(slot) {
             return;
@@ -40,11 +45,11 @@ impl NotificationsApi for Notifications {
             result,
             &self.in_flight,
             slot,
-            Box::new(move |ok, _| callback(ok)),
+            Box::new(move |outcome| callback(outcome.map(|_| ()))),
         );
     }
 
-    fn cancel(&self, id: &str, callback: Box<dyn FnOnce(bool)>) {
+    fn cancel(&self, id: &str, callback: Box<dyn FnOnce(BridgeResult<()>)>) {
         let slot = "notifications.cancel";
         if !self.in_flight.begin(slot) {
             return;
@@ -54,11 +59,11 @@ impl NotificationsApi for Notifications {
             result,
             &self.in_flight,
             slot,
-            Box::new(move |ok, _| callback(ok)),
+            Box::new(move |outcome| callback(outcome.map(|_| ()))),
         );
     }
 
-    fn cancel_all(&self, callback: Box<dyn FnOnce(bool)>) {
+    fn cancel_all(&self, callback: Box<dyn FnOnce(BridgeResult<()>)>) {
         if !self.in_flight.begin("notifications.cancel_all") {
             return;
         }
@@ -67,7 +72,7 @@ impl NotificationsApi for Notifications {
             result,
             &self.in_flight,
             "notifications.cancel_all",
-            Box::new(move |ok, _| callback(ok)),
+            Box::new(move |outcome| callback(outcome.map(|_| ()))),
         );
     }
 }

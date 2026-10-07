@@ -5,7 +5,7 @@ use crate::api::PlatformApi;
 use crate::inflight::InFlight;
 use crate::js::{Listeners, Module, Modules, settle};
 use crate::signal::Signal;
-use crate::types::{LaunchSource, PlatformMessage};
+use crate::types::{BridgeResult, LaunchSource, PlatformId, PlatformMessage};
 
 pub(crate) struct Platform {
     module: Module,
@@ -13,6 +13,7 @@ pub(crate) struct Platform {
     listeners: Listeners,
     audio: Signal<bool>,
     pause: Signal<bool>,
+    sent: Signal<String>,
 }
 
 impl Platform {
@@ -24,18 +25,22 @@ impl Platform {
             listeners: Listeners::default(),
             audio: Signal::new(),
             pause: Signal::new(),
+            sent: Signal::new(),
         };
         platform.listeners.listen(
-            &module,
             "audio_state_changed",
             |value| value.as_bool().unwrap_or(false),
             &platform.audio,
         );
         platform.listeners.listen(
-            &module,
             "pause_state_changed",
             |value| value.as_bool().unwrap_or(false),
             &platform.pause,
+        );
+        platform.listeners.listen(
+            "platform_message_sent",
+            |value| value.as_string().unwrap_or_default(),
+            &platform.sent,
         );
         Some(Rc::new(platform))
     }
@@ -44,6 +49,14 @@ impl Platform {
 impl PlatformApi for Platform {
     fn id(&self) -> Option<String> {
         self.module.string("id")
+    }
+
+    fn platform_id(&self) -> Option<PlatformId> {
+        self.module.text("id")
+    }
+
+    fn sdk(&self) -> Option<String> {
+        self.module.string("sdk")
     }
 
     fn payload(&self) -> Option<String> {
@@ -68,6 +81,10 @@ impl PlatformApi for Platform {
 
     fn is_audio_enabled(&self) -> bool {
         self.module.bool("isAudioEnabled")
+    }
+
+    fn is_paused(&self) -> bool {
+        self.module.bool("isPaused")
     }
 
     fn is_external_calls_supported(&self) -> bool {
@@ -104,22 +121,18 @@ impl PlatformApi for Platform {
         );
     }
 
-    fn get_server_time(&self, callback: Box<dyn FnOnce(i64)>) {
-        if !self.in_flight.begin("platform.get_server_time") {
+    fn get_server_time(&self, callback: Box<dyn FnOnce(BridgeResult<i64>)>) {
+        let slot = "platform.get_server_time";
+        if !self.in_flight.begin(slot) {
             return;
         }
         let result = self.module.call0("getServerTime");
         settle(
             result,
             &self.in_flight,
-            "platform.get_server_time",
-            Box::new(move |ok, value| {
-                let millis = if ok {
-                    value.as_f64().map_or(0, |v| v as i64)
-                } else {
-                    0
-                };
-                callback(millis);
+            slot,
+            Box::new(move |outcome| {
+                callback(outcome.map(|value| value.as_f64().map_or(0, |millis| millis as i64)))
             }),
         );
     }
@@ -130,5 +143,9 @@ impl PlatformApi for Platform {
 
     fn pause_state_changed(&self) -> &Signal<bool> {
         &self.pause
+    }
+
+    fn message_sent(&self) -> &Signal<String> {
+        &self.sent
     }
 }

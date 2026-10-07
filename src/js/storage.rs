@@ -4,20 +4,30 @@ use wasm_bindgen::JsValue;
 use crate::api::StorageApi;
 use crate::convert;
 use crate::inflight::InFlight;
-use crate::js::{Module, Modules, settle};
-use crate::types::StorageValue;
+use crate::js::{Listeners, Module, Modules, settle};
+use crate::signal::Signal;
+use crate::types::{BridgeResult, StorageValue};
 
 pub(crate) struct Storage {
     module: Module,
     in_flight: InFlight,
+    listeners: Listeners,
+    performed: Signal<()>,
 }
 
 impl Storage {
     pub(crate) fn attach(modules: &Modules, in_flight: &InFlight) -> Option<Rc<dyn StorageApi>> {
-        Some(Rc::new(Self {
-            module: modules.get("storage")?,
+        let module = modules.get("storage")?;
+        let storage = Self {
+            module: module.clone(),
             in_flight: in_flight.clone(),
-        }))
+            listeners: Listeners::default(),
+            performed: Signal::new(),
+        };
+        storage
+            .listeners
+            .listen("storage_set", |_| (), &storage.performed);
+        Some(Rc::new(storage))
     }
 }
 
@@ -42,7 +52,7 @@ impl StorageApi for Storage {
         &self,
         keys: &[&str],
         try_parse_json: bool,
-        callback: Box<dyn FnOnce(bool, Vec<StorageValue>)>,
+        callback: Box<dyn FnOnce(BridgeResult<Vec<StorageValue>>)>,
     ) {
         if !self.in_flight.begin("storage.get") {
             return;
@@ -58,21 +68,18 @@ impl StorageApi for Storage {
             result,
             &self.in_flight,
             "storage.get",
-            Box::new(move |ok, value| {
-                let values = if ok {
+            Box::new(move |outcome| {
+                callback(outcome.map(|value| {
                     convert::array_to_vec(&value)
                         .iter()
                         .map(|item| from_js(item, try_parse_json))
                         .collect()
-                } else {
-                    Vec::new()
-                };
-                callback(ok, values);
+                }))
             }),
         );
     }
 
-    fn set(&self, pairs: &[(&str, StorageValue)], callback: Box<dyn FnOnce(bool)>) {
+    fn set(&self, pairs: &[(&str, StorageValue)], callback: Box<dyn FnOnce(BridgeResult<()>)>) {
         if !self.in_flight.begin("storage.set") {
             return;
         }
@@ -84,11 +91,11 @@ impl StorageApi for Storage {
             result,
             &self.in_flight,
             "storage.set",
-            Box::new(move |ok, _| callback(ok)),
+            Box::new(move |outcome| callback(outcome.map(|_| ()))),
         );
     }
 
-    fn delete(&self, keys: &[&str], callback: Box<dyn FnOnce(bool)>) {
+    fn delete(&self, keys: &[&str], callback: Box<dyn FnOnce(BridgeResult<()>)>) {
         if !self.in_flight.begin("storage.delete") {
             return;
         }
@@ -97,7 +104,11 @@ impl StorageApi for Storage {
             result,
             &self.in_flight,
             "storage.delete",
-            Box::new(move |ok, _| callback(ok)),
+            Box::new(move |outcome| callback(outcome.map(|_| ()))),
         );
+    }
+
+    fn set_performed(&self) -> &Signal<()> {
+        &self.performed
     }
 }

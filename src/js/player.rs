@@ -3,6 +3,7 @@ use std::rc::Rc;
 use crate::api::{ObjectMap, PlayerApi};
 use crate::inflight::InFlight;
 use crate::js::{Module, Modules, convert, settle};
+use crate::types::BridgeResult;
 
 pub(crate) struct Player {
     module: Module,
@@ -55,8 +56,13 @@ impl PlayerApi for Player {
         self.module.map("extra")
     }
 
-    fn authorize(&self, options: Option<&serde_json::Value>, callback: Box<dyn FnOnce(bool)>) {
-        if !self.in_flight.begin("player.authorize") {
+    fn authorize(
+        &self,
+        options: Option<&serde_json::Value>,
+        callback: Box<dyn FnOnce(BridgeResult<()>)>,
+    ) {
+        let slot = "player.authorize";
+        if !self.in_flight.begin(slot) {
             return;
         }
         let result = self
@@ -65,8 +71,8 @@ impl PlayerApi for Player {
         settle(
             result,
             &self.in_flight,
-            "player.authorize",
-            Box::new(move |ok, _| callback(ok)),
+            slot,
+            Box::new(move |outcome| callback(outcome.map(|_| ()))),
         );
     }
 }

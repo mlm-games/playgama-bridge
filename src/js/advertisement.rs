@@ -6,7 +6,7 @@ use crate::convert;
 use crate::inflight::InFlight;
 use crate::js::{Listeners, Module, Modules, settle};
 use crate::signal::Signal;
-use crate::types::{BannerPosition, BannerState, InterstitialState, RewardedState};
+use crate::types::{BannerPosition, BannerState, BridgeResult, InterstitialState, RewardedState};
 
 pub(crate) struct Advertisement {
     module: Module,
@@ -34,25 +34,21 @@ impl Advertisement {
             advanced_banners: Signal::new(),
         };
         ads.listeners.listen(
-            &module,
             "banner_state_changed",
             |value| convert::as_string(value).and_then(|s| s.parse().ok()),
             &ads.banner,
         );
         ads.listeners.listen(
-            &module,
             "interstitial_state_changed",
             |value| convert::as_string(value).and_then(|s| s.parse().ok()),
             &ads.interstitial,
         );
         ads.listeners.listen(
-            &module,
             "rewarded_state_changed",
             |value| convert::as_string(value).and_then(|s| s.parse().ok()),
             &ads.rewarded,
         );
         ads.listeners.listen(
-            &module,
             "advanced_banners_state_changed",
             |value| convert::as_string(value).and_then(|s| s.parse().ok()),
             &ads.advanced_banners,
@@ -125,9 +121,19 @@ impl AdvertisementApi for Advertisement {
         self.module.call0("hideBanner");
     }
 
+    fn preload_interstitial(&self, placement: Option<&str>) {
+        self.module
+            .call_opt("preloadInterstitial", Some(placement_arg(placement)));
+    }
+
     fn show_interstitial(&self, placement: Option<&str>) {
         self.module
             .call_opt("showInterstitial", Some(placement_arg(placement)));
+    }
+
+    fn preload_rewarded(&self, placement: Option<&str>) {
+        self.module
+            .call_opt("preloadRewarded", Some(placement_arg(placement)));
     }
 
     fn show_rewarded(&self, placement: Option<&str>) {
@@ -144,22 +150,18 @@ impl AdvertisementApi for Advertisement {
         self.module.call0("hideAdvancedBanners");
     }
 
-    fn check_adblock(&self, callback: Box<dyn FnOnce(bool)>) {
-        if !self.in_flight.begin("advertisement.check_adblock") {
+    fn check_adblock(&self, callback: Box<dyn FnOnce(BridgeResult<bool>)>) {
+        let slot = "advertisement.check_adblock";
+        if !self.in_flight.begin(slot) {
             return;
         }
         let result = self.module.call0("checkAdBlock");
         settle(
             result,
             &self.in_flight,
-            "advertisement.check_adblock",
-            Box::new(move |ok, value| {
-                let blocked = if ok {
-                    value.as_bool().unwrap_or(false)
-                } else {
-                    false
-                };
-                callback(blocked);
+            slot,
+            Box::new(move |outcome| {
+                callback(outcome.map(|blocked| blocked.as_bool().unwrap_or(false)))
             }),
         );
     }

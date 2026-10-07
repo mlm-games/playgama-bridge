@@ -5,6 +5,7 @@ use crate::api::{ObjectMap, PaymentsApi};
 use crate::convert;
 use crate::inflight::InFlight;
 use crate::js::{Module, Modules, settle};
+use crate::types::BridgeResult;
 
 pub(crate) struct Payments {
     module: Module,
@@ -29,7 +30,7 @@ impl PaymentsApi for Payments {
         &self,
         id: &str,
         options: Option<&serde_json::Value>,
-        callback: Box<dyn FnOnce(bool, Option<ObjectMap>)>,
+        callback: Box<dyn FnOnce(BridgeResult<Option<ObjectMap>>)>,
     ) {
         let slot = "payments.purchase";
         if !self.in_flight.begin(slot) {
@@ -42,15 +43,17 @@ impl PaymentsApi for Payments {
             result,
             &self.in_flight,
             slot,
-            Box::new(move |ok, value| {
-                let details =
-                    (ok && convert::typeof_object(&value)).then(|| convert::object_to_map(&value));
-                callback(ok, details);
+            Box::new(move |outcome| {
+                callback(outcome.map(|value| convert::optional_object(&value)))
             }),
         );
     }
 
-    fn consume_purchase(&self, id: &str, callback: Box<dyn FnOnce(bool, Option<ObjectMap>)>) {
+    fn consume_purchase(
+        &self,
+        id: &str,
+        callback: Box<dyn FnOnce(BridgeResult<Option<ObjectMap>>)>,
+    ) {
         let slot = "payments.consume_purchase";
         if !self.in_flight.begin(slot) {
             return;
@@ -60,15 +63,13 @@ impl PaymentsApi for Payments {
             result,
             &self.in_flight,
             slot,
-            Box::new(move |ok, value| {
-                let details =
-                    (ok && convert::typeof_object(&value)).then(|| convert::object_to_map(&value));
-                callback(ok, details);
+            Box::new(move |outcome| {
+                callback(outcome.map(|value| convert::optional_object(&value)))
             }),
         );
     }
 
-    fn get_catalog(&self, callback: Box<dyn FnOnce(bool, Vec<ObjectMap>)>) {
+    fn get_catalog(&self, callback: Box<dyn FnOnce(BridgeResult<Vec<ObjectMap>>)>) {
         let slot = "payments.get_catalog";
         if !self.in_flight.begin(slot) {
             return;
@@ -78,18 +79,13 @@ impl PaymentsApi for Payments {
             result,
             &self.in_flight,
             slot,
-            Box::new(move |ok, value| {
-                let catalog = if ok {
-                    convert::array_to_vec_of_maps(&value)
-                } else {
-                    Vec::new()
-                };
-                callback(ok, catalog);
+            Box::new(move |outcome| {
+                callback(outcome.map(|value| convert::array_to_vec_of_maps(&value)))
             }),
         );
     }
 
-    fn get_purchases(&self, callback: Box<dyn FnOnce(bool, Vec<ObjectMap>)>) {
+    fn get_purchases(&self, callback: Box<dyn FnOnce(BridgeResult<Vec<ObjectMap>>)>) {
         let slot = "payments.get_purchases";
         if !self.in_flight.begin(slot) {
             return;
@@ -99,13 +95,8 @@ impl PaymentsApi for Payments {
             result,
             &self.in_flight,
             slot,
-            Box::new(move |ok, value| {
-                let purchases = if ok {
-                    convert::array_to_vec_of_maps(&value)
-                } else {
-                    Vec::new()
-                };
-                callback(ok, purchases);
+            Box::new(move |outcome| {
+                callback(outcome.map(|value| convert::array_to_vec_of_maps(&value)))
             }),
         );
     }

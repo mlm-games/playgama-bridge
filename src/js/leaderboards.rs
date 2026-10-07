@@ -5,7 +5,7 @@ use crate::api::{LeaderboardsApi, ObjectMap};
 use crate::convert;
 use crate::inflight::InFlight;
 use crate::js::{Module, Modules, settle};
-use crate::types::LeaderboardType;
+use crate::types::{BridgeResult, LeaderboardType};
 
 pub(crate) struct Leaderboards {
     module: Module,
@@ -31,7 +31,7 @@ impl LeaderboardsApi for Leaderboards {
             .unwrap_or(LeaderboardType::NotAvailable)
     }
 
-    fn set_score(&self, id: &str, score: f64, callback: Box<dyn FnOnce(bool)>) {
+    fn set_score(&self, id: &str, score: f64, callback: Box<dyn FnOnce(BridgeResult<()>)>) {
         let slot = "leaderboards.set_score";
         if !self.in_flight.begin(slot) {
             return;
@@ -45,11 +45,11 @@ impl LeaderboardsApi for Leaderboards {
             result,
             &self.in_flight,
             slot,
-            Box::new(move |ok, _| callback(ok)),
+            Box::new(move |outcome| callback(outcome.map(|_| ()))),
         );
     }
 
-    fn get_entries(&self, id: &str, callback: Box<dyn FnOnce(bool, Vec<ObjectMap>)>) {
+    fn get_entries(&self, id: &str, callback: Box<dyn FnOnce(BridgeResult<Vec<ObjectMap>>)>) {
         let slot = "leaderboards.get_entries";
         if !self.in_flight.begin(slot) {
             return;
@@ -59,18 +59,13 @@ impl LeaderboardsApi for Leaderboards {
             result,
             &self.in_flight,
             slot,
-            Box::new(move |ok, value| {
-                let entries = if ok {
-                    convert::array_to_vec_of_maps(&value)
-                } else {
-                    Vec::new()
-                };
-                callback(ok, entries);
+            Box::new(move |outcome| {
+                callback(outcome.map(|value| convert::array_to_vec_of_maps(&value)))
             }),
         );
     }
 
-    fn show_native_popup(&self, id: &str, callback: Box<dyn FnOnce(bool)>) {
+    fn show_native_popup(&self, id: &str, callback: Box<dyn FnOnce(BridgeResult<()>)>) {
         let slot = "leaderboards.show_native_popup";
         if !self.in_flight.begin(slot) {
             return;
@@ -80,7 +75,7 @@ impl LeaderboardsApi for Leaderboards {
             result,
             &self.in_flight,
             slot,
-            Box::new(move |ok, _| callback(ok)),
+            Box::new(move |outcome| callback(outcome.map(|_| ()))),
         );
     }
 }
